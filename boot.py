@@ -4,6 +4,8 @@ import time
 import signal
 import sys
 import re
+import json
+import urllib.request
 from datetime import datetime
 
 # === 1. 环境变量 ===
@@ -27,54 +29,78 @@ p_nginx = None
 p_alist = None
 p_cloud = None
 
-# === 3. 工具函数 ===
+# === 3. 智能 DNS 穿透 (核心修复代码) ===
+def resolve_ip_doh(domain):
+    """通过 Google DoH 获取域名的真实 A 记录"""
+    print(f">>> [Kernel] Resolving {domain} via Google DoH...")
+    try:
+        # 使用 Google Public DNS over HTTPS
+        url = f"https://dns.google/resolve?name={domain}&type=A"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            if "Answer" in data:
+                for answer in data["Answer"]:
+                    if answer["type"] == 1: # A record
+                        return answer["data"]
+    except Exception as e:
+        print(f">>> [Kernel] DoH Lookup Failed for {domain}: {e}")
+    return None
+
+def patch_network_smart():
+    print(">>> [Kernel] Initializing network patch...")
+    
+    # 我们需要修复两个域名，防止 S3 链接不上
+    targets = ["s3.huggingface.co", "huggingface.co"]
+    
+    # 优先使用 hosts 文件解析
+    try:
+        with open("/etc/nsswitch.conf", "w") as f:
+            f.write("hosts: files dns\nnetworks: files\n")
+    except: pass
+
+    resolved_map = {}
+    
+    # 1. 动态获取 IP
+    for domain in targets:
+        ip = resolve_ip_doh(domain)
+        if ip:
+            resolved_map[domain] = ip
+            print(f">>> [Kernel] Got IP for {domain}: {ip}")
+        else:
+            # 获取失败时的保底 IP (AWS US-East-1)
+            print(f">>> [Kernel] Failed to resolve {domain}, using fallback.")
+            resolved_map[domain] = "18.172.170.60" 
+
+    # 2. 写入 /etc/hosts
+    try:
+        with open("/etc/hosts", "a") as f:
+            f.write("\n# Smart DoH Patch\n")
+            for domain, ip in resolved_map.items():
+                f.write(f"{ip} {domain}\n")
+        
+        # 打印出来确认
+        # with open("/etc/hosts", "r") as f: print(f.read())
+        print(">>> [Kernel] Network patch applied.")
+            
+    except Exception as e:
+        print(f">>> [Kernel] Host write error: {e}")
+
+# === 4. 基础工具函数 ===
 def run_cmd(cmd):
     try:
         subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
-    except subprocess.CalledProcessError:
-        return False
+    except: return False
 
-# === 4. 暴力网络修复 (Nuclear Fix) ===
-def patch_network_force():
-    print(">>> [Kernel] Applying nuclear network patch...")
-    
-    # 1. 定义 s3.huggingface.co 的真实 IP (AWS US-East-1 节点)
-    # 这些是长期稳定的 CloudFront/ALB IP
-    target_domain = "s3.huggingface.co"
-    ips = [
-        "18.172.170.60",
-        "18.172.170.92", 
-        "18.172.170.36",
-        "18.172.170.52"
-    ]
-    
+def set_secret():
+    """强制设置 Alist 密码"""
     try:
-        # 2. 强制配置 nsswitch.conf 确保优先读取 hosts 文件
-        with open("/etc/nsswitch.conf", "w") as f:
-            f.write("hosts: files dns\n")
-            f.write("networks: files\n")
-        print(">>> [Kernel] nsswitch.conf patched (priority: files).")
-    except Exception as e:
-        print(f">>> [Kernel] nsswitch patch failed: {e}")
+        subprocess.run([ALIST_BIN, "admin", "set", SYS_TOKEN], cwd=CORE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except: pass
 
-    try:
-        # 3. 写入 /etc/hosts
-        with open("/etc/hosts", "a") as f:
-            f.write("\n# Force HuggingFace S3 IPs\n")
-            for ip in ips:
-                f.write(f"{ip} {target_domain}\n")
-        
-        # 4. 验证写入结果 (打印到日志)
-        print(">>> [Kernel] Verifying /etc/hosts content:")
-        with open("/etc/hosts", "r") as f:
-            print(f.read())
-        print(">>> [Kernel] Hosts file patched successfully.")
-        
-    except Exception as e:
-        print(f">>> [Kernel] FATAL: Could not write to /etc/hosts: {e}")
-
-# === 5. 备份逻辑 (保持原样) ===
+# === 5. 备份逻辑 (WebDAV) ===
 def get_remote_url(filename=""):
     return f"{WEBDAV_URL}/{BACKUP_PATH}/{filename}"
 
@@ -128,24 +154,26 @@ def restore_latest():
     if cloud_backups:
         run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(cloud_backups[-1])}' -o '{CLOUD_DB_LOCAL}' --silent --insecure")
 
-def set_secret():
-    try:
-        subprocess.run([ALIST_BIN, "admin", "set", SYS_TOKEN], cwd=CORE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(">>> [Kernel] Credentials updated.")
-    except Exception: pass
-
 # === 6. 启动流程 ===
 def start_services():
     global p_nginx, p_alist, p_cloud
     
-    # 0. 先执行暴力网络修复
-    patch_network_force()
+    # 1. 优先执行网络修复
+    patch_network_smart()
     
     os.makedirs(f"{CORE_DIR}/data", exist_ok=True)
+    
+    # 2. 启动 Alist
     p_alist = subprocess.Popen([ALIST_BIN, "server", "--no-prefix"], cwd=CORE_DIR)
+    
+    # 3. 设置密码
     time.sleep(5)
     set_secret() 
+    
+    # 4. 启动 Cloudreve
     p_cloud = subprocess.Popen([CLOUD_BIN, "-c", "conf.ini"], cwd=CORE_DIR)
+    
+    # 5. 启动 Nginx
     print(">>> [Kernel] System Online.")
     p_nginx = subprocess.Popen(["nginx", "-g", "daemon off;"])
 
