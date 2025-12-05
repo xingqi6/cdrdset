@@ -4,8 +4,6 @@ import time
 import signal
 import sys
 import re
-import json
-import urllib.request
 from datetime import datetime
 
 # === 1. 环境变量 ===
@@ -37,43 +35,46 @@ def run_cmd(cmd):
     except subprocess.CalledProcessError:
         return False
 
-# === 4. 核心修复：DNS-over-HTTPS (DoH) ===
-def patch_hosts_with_doh():
-    """
-    通过 Cloudflare DoH 获取 s3.huggingface.co 的 IP，
-    并写入 /etc/hosts，绕过容器损坏的 DNS 服务。
-    """
-    target_domain = "s3.huggingface.co"
-    doh_url = f"https://1.1.1.1/dns-query?name={target_domain}&type=A"
+# === 4. 暴力网络修复 (Nuclear Fix) ===
+def patch_network_force():
+    print(">>> [Kernel] Applying nuclear network patch...")
     
-    print(f">>> [Kernel] Resolving {target_domain} via DoH...")
+    # 1. 定义 s3.huggingface.co 的真实 IP (AWS US-East-1 节点)
+    # 这些是长期稳定的 CloudFront/ALB IP
+    target_domain = "s3.huggingface.co"
+    ips = [
+        "18.172.170.60",
+        "18.172.170.92", 
+        "18.172.170.36",
+        "18.172.170.52"
+    ]
     
     try:
-        # 构造请求，Accept头必须是 application/dns-json
-        req = urllib.request.Request(doh_url, headers={"Accept": "application/dns-json"})
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode())
-            
-            if "Answer" in data:
-                # 获取解析到的 IP
-                ip = data["Answer"][0]["data"]
-                print(f">>> [Kernel] Resolved IP: {ip}")
-                
-                # 写入 /etc/hosts
-                with open("/etc/hosts", "a") as f:
-                    f.write(f"\n{ip} {target_domain}\n")
-                print(">>> [Kernel] /etc/hosts patched successfully.")
-            else:
-                print(">>> [Kernel] DoH failed: No answer section.")
-                
+        # 2. 强制配置 nsswitch.conf 确保优先读取 hosts 文件
+        with open("/etc/nsswitch.conf", "w") as f:
+            f.write("hosts: files dns\n")
+            f.write("networks: files\n")
+        print(">>> [Kernel] nsswitch.conf patched (priority: files).")
     except Exception as e:
-        print(f">>> [Kernel] DoH Error: {e}")
-        # 如果 DoH 失败，尝试硬编码一个备用 IP (HF S3 的常用 IP)
-        print(">>> [Kernel] Using fallback IP.")
-        with open("/etc/hosts", "a") as f:
-            f.write("\n18.172.170.60 s3.huggingface.co\n")
+        print(f">>> [Kernel] nsswitch patch failed: {e}")
 
-# === 5. 备份逻辑 (保留) ===
+    try:
+        # 3. 写入 /etc/hosts
+        with open("/etc/hosts", "a") as f:
+            f.write("\n# Force HuggingFace S3 IPs\n")
+            for ip in ips:
+                f.write(f"{ip} {target_domain}\n")
+        
+        # 4. 验证写入结果 (打印到日志)
+        print(">>> [Kernel] Verifying /etc/hosts content:")
+        with open("/etc/hosts", "r") as f:
+            print(f.read())
+        print(">>> [Kernel] Hosts file patched successfully.")
+        
+    except Exception as e:
+        print(f">>> [Kernel] FATAL: Could not write to /etc/hosts: {e}")
+
+# === 5. 备份逻辑 (保持原样) ===
 def get_remote_url(filename=""):
     return f"{WEBDAV_URL}/{BACKUP_PATH}/{filename}"
 
@@ -137,8 +138,8 @@ def set_secret():
 def start_services():
     global p_nginx, p_alist, p_cloud
     
-    # 优先执行 Host 修复
-    patch_hosts_with_doh()
+    # 0. 先执行暴力网络修复
+    patch_network_force()
     
     os.makedirs(f"{CORE_DIR}/data", exist_ok=True)
     p_alist = subprocess.Popen([ALIST_BIN, "server", "--no-prefix"], cwd=CORE_DIR)
