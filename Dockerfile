@@ -1,12 +1,13 @@
 # 基础镜像
 FROM python:3.9-slim
 
-# === 1. 基础环境 ===
+# === 1. 基础环境 (新增 ca-certificates) ===
 RUN apt-get update && apt-get install -y \
     nginx \
     curl \
     wget \
     procps \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # === 2. 隐蔽目录 ===
@@ -25,16 +26,13 @@ RUN wget https://github.com/cloudreve/cloudreve/releases/download/3.8.3/cloudrev
     && mv cloudreve net_service \
     && rm cloudreve_3.8.3_linux_amd64.tar.gz
 
+# 赋予权限
 RUN chmod +x io_driver net_service
 
 # === 4. 植入配置文件 ===
-# 复制伪装静态页
 COPY fake_site /var/www/html
-# 复制 Nginx 代理配置
 COPY nginx.conf /etc/nginx/sites-available/default
-# 复制 Cloudreve 数据库配置
 COPY conf.ini /usr/local/sys_kernel/conf.ini
-# 复制核心启动脚本
 COPY boot.py /usr/local/sys_kernel/boot.py
 
 # === 5. 权限与端口 ===
